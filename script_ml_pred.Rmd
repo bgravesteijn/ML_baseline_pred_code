@@ -7,6 +7,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+library(bgravesteijn)
 library(foreign)
 library(data.table)
 library(tableone)
@@ -14,7 +15,6 @@ library(mice)
 library(miceadds)
 library(caret)
 library(kernlab)
-library(bgravesteijn)
 library(randomForest)
 library(gbm)
 library(nnet)
@@ -75,9 +75,7 @@ labs$Labs.DLHemoglobingdL <- ifelse(labs$Labs.DLHemoglobinOtherUnit=="mmol/L",
                                    labs$Labs.DLHemoglobinOther*1.61,
                                    labs$Labs.DLHemoglobingdL)
 labs <- data.table(labs)
-labs <- labs[,.(first(Labs.DLGlucosemmolL), 
-                first(Labs.DLSodiummmolL), 
-                first(Labs.DLHemoglobingdL)), by=gupi]
+labs <- labs[,.(first(Labs.DLGlucosemmolL), first(Labs.DLSodiummmolL), first(Labs.DLGlucosemmolL)), by=gupi]
 colnames(labs) <- c("gupi", "glucose", "sodium", "hb")
 
 hb_qq99<- quantile(labs$hb, probs=0.99, na.rm = TRUE)
@@ -208,12 +206,26 @@ bothi <- complete(bothi, 1)
 bothi$unfav <- factor(ifelse(bothi$d_gos%in%c(2,3),"unfav","fav"))
 bothi$mort  <- factor(ifelse(bothi$d_gos==2,"dead","alive"))
 
+##normalize variables
 meansodium <- mean(bothi$sodium)
 sdsodium   <- sd(bothi$sodium)
 bothi$sodium <- (bothi$sodium-meansodium)/sdsodium
+meanhb <- mean(bothi$hb)
+sdhb   <- sd(bothi$hb)
+bothi$hb <- (bothi$hb-meanhb)/sdhb
+meanglu <- mean(bothi$glucose)
+sdglu   <- sd(bothi$glucose)
+bothi$glucose <- (bothi$glucose-meanglu)/sdglu
+meanage <- mean(bothi$age)
+sdage <- sd(bothi$age)
+bothi$age <- (bothi$age-meanage)/sdage
 
-bothi$age_dec <- bothi$age/10
-
+##one-hot encode
+multvars <- c("d_motor", "d_pupil", "ct_class")
+dmy <- dummyVars(" ~ .",data =  bothi[,multvars])
+onehot <- predict(dmy, newdata=bothi[,multvars])
+bothi <- bothi[,-which(colnames(bothi)%in%multvars)] 
+bothi <- cbind(bothi,onehot)
 
 source("ll.calc.R")
 fitControl<- trainControl(## 10-fold CV
@@ -225,345 +237,48 @@ fitControl<- trainControl(## 10-fold CV
   ##specify which metric to optimize
   summaryFunction = ll.calc)
 
-models <- c("LR", "svmRadial", "rf", "nnet", "gbm", "lasso","ridge")
+models <- c("LR", "svmLinear", "ranger", "nnet", "gbm", "lasso","ridge")
 trials <- as.character(unique(bothi$trial))
-result.cv.perstudy <- expand.grid(study   = trials,
-                                  model   = models,
-                                  outcome = c("unfav", "mort"),
-                                  measure = c("a", "b", "c"),
-                                  est     = NA,
-                                  lo      = NA,
-                                  hi      = NA,
-                                  nice    = NA)
 source("Val.prob.ci.2/auc.nonpara.mw.R")
 source("Val.prob.ci.2/ci.auc.R")
 source("Val.prob.ci.2/val.prob.ci.2.R")
+
+vars <- c("age", 
+          paste("d_motor",1:6, sep="."), 
+          paste("d_pupil", 1:3, sep="."), 
+          paste("ct_class",1:5, sep="."),
+          "tsah", "edh", "hypoxia", "hypotens", "glucose", "hb")
+vars_mort <- c(vars,"mort")
+vars_unfav <- c(vars,"unfav")
 ```
 
 
+train and validate: cv_perstudy.R or cv_10x.R
 
-```{r train and validate, eval=FALSE}
-pdf("Output/calibration_plots.pdf")
-set.seed(12)
-for (i in models){
-  for (j in 1:length(trials)){
-    
-    ####TRAIN MODELS
-    if(i == "LR"){
-      mort_fit <- glm(mort ~ . , 
-                      data = bothi[bothi$trial!=trials[j],
-                                   c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                     "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                     "mort")],
-                      family = "binomial")
-      unfav_fit <- glm(unfav ~ . , 
-                      data = bothi[bothi$trial!=trials[j],
-                                   c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                     "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                     "unfav")],
-                      family = "binomial")
-    }else{
-      if(i=="lasso"){
-         dat.mort <- bothi[bothi$trial!=trials[j],
-                                      c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                        "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                        "mort")]
-          ### no/yes into 0/1
-          for(k in 5:ncol(dat.mort)){    
-            if(is.factor(dat.mort[,k])){
-              levels(dat.mort[,k]) <- 0:1
-            }
-          }
-          y <- as.numeric(dat.mort$mort)
-          y[y==1] <- 0
-          y[y==2] <- 1
-          mort_fit<-cv.glmnet(x = data.matrix(dat.mort[,-ncol(dat.mort)]),
-                              y=  y, 
-                              family="binomial",
-                              alpha=1,
-                              type.measure="class")
-          
-          dat.unfav <- bothi[bothi$trial!=trials[j],
-                                      c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                        "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                        "unfav")]
-          ### no/yes into 0/1
-          for(k in 5:ncol(dat.unfav)){
-            if(is.factor(dat.unfav[,k])){
-              levels(dat.unfav[,k]) <- 0:1
-            }
-          }
-          y <- as.numeric(dat.unfav$unfav)
-          y[y==1] <- 0
-          y[y==2] <- 1
-          unfav_fit<-cv.glmnet(x = data.matrix(dat.unfav[,-ncol(dat.unfav)]),
-                              y=  y,
-                              alpha=1, 
-                              family="binomial",
-                              type.measure="class")
-      }else{
-        if(i=="ridge"){
-          dat.mort <- bothi[bothi$trial!=trials[j],
-                                      c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                        "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                        "mort")]
-          ### no/yes into 0/1
-          for(k in 5:ncol(dat.mort)){    
-            if(is.factor(dat.mort[,k])){
-              levels(dat.mort[,k]) <- 0:1
-            }
-          }
-          y <- as.numeric(dat.mort$mort)
-          y[y==1] <- 0
-          y[y==2] <- 1
-          mort_fit<-cv.glmnet(x = data.matrix(dat.mort[,-ncol(dat.mort)]),
-                              y=  y, 
-                              family="binomial",
-                              alpha=0,
-                              type.measure="class")
-          
-          dat.unfav <- bothi[bothi$trial!=trials[j],
-                                      c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                        "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                        "unfav")]
-          ### no/yes into 0/1
-          for(k in 5:ncol(dat.unfav)){
-            if(is.factor(dat.unfav[,k])){
-              levels(dat.unfav[,k]) <- 0:1
-            }
-          }
-          y <- as.numeric(dat.unfav$unfav)
-          y[y==1] <- 0
-          y[y==2] <- 1
-          unfav_fit<-cv.glmnet(x = data.matrix(dat.unfav[,-ncol(dat.unfav)]),
-                              y= y , 
-                              family="binomial",
-                              alpha=0,
-                              type.measure="class")
-        }else{
-          if(i=="rf"){
-            tunegrid <- expand.grid(ntree=c(200,500,800),
-                                    mtry=c(2, 10, 18))
-            fitControl_rf<- trainControl(## 10-fold CV
-              method = "repeatedcv",
-              number = 10,
-              ## repeated ten times
-              repeats = 10,
-              classProbs=TRUE,
-              ##specify which metric to optimize
-              summaryFunction = ll.calc)
-            mort_fit <- train(mort ~ . , 
-                        data = bothi[bothi$trial!=trials[j],
-                                     c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                       "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                       "mort")], 
-                        method = i, 
-                        trControl = fitControl_rf,
-                        ## This last option is actually one
-                        ## for gbm() that passes through
-                        metric = "LogLik",
-                        tuneGrid = tunegrid)
-      unfav_fit <- train(unfav ~ . , 
-                         data = bothi[bothi$trial!=trials[j],
-                                      c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                        "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                        "unfav")], 
-                         method = i, 
-                         trControl = fitControl_rf,
-                         ## This last option is actually one
-                         ## for gbm() that passes through
-                         metric = "LogLik",
-                         tuneGrid = tunegrid)
-          }else{
-            if(i=="nnet"){
-              tunegrid <- expand.grid(size=c(5,7,10,12,15),
-                                      decay=c(0, 0.1, 0.01))
-            }
-            if(i=="gbm"){
-              tunegrid <- expand.grid(interaction.depth=c(1,2,3),
-                                      n.trees=c(100, 150, 200,250))
-            }
-            if(i=="svmRadial"){
-              tunegrid <- expand.grid(C=c(0.25,0.5,1))
-            }
-          mort_fit <- train(mort ~ . , 
-                        data = bothi[bothi$trial!=trials[j],
-                                     c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                       "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                       "mort")], 
-                        method = i, 
-                        trControl = fitControl,
-                        ## This last option is actually one
-                        ## for gbm() that passes through
-                        metric = "LogLik",
-                        tuneGrid = tunegrid)
-      unfav_fit <- train(unfav ~ . , 
-                         data = bothi[bothi$trial!=trials[j],
-                                      c("age_dec", "d_motor", "d_pupil", "ct_class", 
-                                        "tsah", "edh", "hypoxia", "hypotens", "glucose", 
-                                        "unfav")], 
-                         method = i, 
-                         trControl = fitControl,
-                         ## This last option is actually one
-                         ## for gbm() that passes through
-                         metric = "LogLik",
-                         tuneGrid = tunegrid)
-          }#close no rf
-        }#close no ridge
-       }#close no lasso
-      }#close no lr
+## internal-external and external
 
-#####validate
-        
-        calc.val_abc <- function(data, measure=NULL,outcome=NULL){
-          ##calculate predictions 
-          if(outcome=="mort"){
-            if(i=="LR"){
-              pred <- predict(mort_fit, newdata=data,type="response")
-            }else{
-              if(i%in%c("lasso", "ridge")){
-                data <- data[,colnames(dat.mort)]
-                for(k in 5:ncol(data)){
-                  if(is.factor(data[,k])){
-                  levels(data[,k]) <- 0:1
-                    }
-                   }
-                pred <- c(predict(mort_fit, 
-                                newx=data.matrix(data[,-ncol(data)]),
-                                s="lambda.min",type="response"))
-              }else{
-               pred <- predict(mort_fit, newdata=data,type="prob") 
-              }
-            }
-          }else{
-            if(i=="LR"){
-              pred <- predict(unfav_fit, newdata=data,type="response")
-            }else{
-              if(i%in%c("lasso", "ridge")){
-                data <- data[,colnames(dat.unfav)]
-                for(i in 5:ncol(data)){
-                  if(is.factor(data[,i])){
-                  levels(data[,i]) <- 0:1
-                    }
-                }
-                
-                pred <- predict(unfav_fit, 
-                                newx=data.matrix(data[,-ncol(data)]),
-                                s="lambda.min",type="response")
-              }else{
-               pred <- predict(unfav_fit, newdata=data,type="prob") 
-              }
-            }
-          }
-          
-          ##OBTAIN PREDICTIONS
-          if(i%in%c(models[2:5])){ #for svm/gbm/nnet and rf
-            if(outcome=="mort"){
-              pred <- pred$dead
-            }else{
-              pred <- pred$unfav
-            }
-          }
-          #IF predictions are 1 or 0, make them almost that so that LR works 
-          pred[pred==1] <- 0.999
-          pred[pred==0] <- 0.001
-          
-          ##FIT CALLIBRATION MODEL
-          
-          
-          if(measure=="A"){
-            vp <- rms::lrm(data[,outcome]~offset(qlogis(pred)))
-            beta <- vp$coefficients[1]
-            se <- sqrt(diag(vp$var))[1] 
-            return(c(beta, beta-1.96*se, beta+1.96*se))  
-          }
-          if(measure=="B"){
-            vp <- rms::lrm(data[,outcome]~qlogis(pred))
-            beta <-  vp$coefficients[2]
-            se <- sqrt(diag(vp$var))[2] 
-            return(c(beta, beta-1.96*se, beta+1.96*se))
-          }
-          if(measure=="C"){
-            if(outcome=="mort"){
-              obs <- data$mort
-            }else{
-              obs <- data$unfav
-            }
-            res <- roc(obs~pred)
-            
-            
-            #calibration plot
-            obs <- as.numeric(obs)
-            obs[obs==1] <- 0
-            obs[obs==2] <- 1
-            val.prob.ci.2(p = pred, y = obs, logit = "p",
-                          main=paste(i, trials[j], outcome))
-            return(c(pROC::ci.auc(res, pred = ))[c(2,1,3)])
-          }
-        }
-        
-        ###SAVE RESULTS
-        result.cv.perstudy[result.cv.perstudy$study==trials[j]&
-                             result.cv.perstudy$model==i&
-                             result.cv.perstudy$measure=="a"&
-                             result.cv.perstudy$outcome=="mort",
-                           c("est","lo", "hi")] <- calc.val_abc(
-                             data = bothi[bothi$trial==trials[j],],
-                             measure = "A",
-                             outcome = "mort")
-        result.cv.perstudy[result.cv.perstudy$study==trials[j]&
-                             result.cv.perstudy$model==i&
-                             result.cv.perstudy$measure=="a"&
-                             result.cv.perstudy$outcome=="unfav",
-                           c("est","lo", "hi")] <- calc.val_abc(
-                             data = bothi[bothi$trial==trials[j],],
-                             measure = "A",
-                             outcome = "unfav")
-        result.cv.perstudy[result.cv.perstudy$study==trials[j]&
-                             result.cv.perstudy$model==i&
-                             result.cv.perstudy$measure=="b"&
-                             result.cv.perstudy$outcome=="mort",
-                           c("est","lo", "hi")] <- calc.val_abc(
-                             data = bothi[bothi$trial==trials[j],],
-                             measure = "B",
-                             outcome = "mort")
-        result.cv.perstudy[result.cv.perstudy$study==trials[j]&
-                             result.cv.perstudy$model==i&
-                             result.cv.perstudy$measure=="b"&
-                             result.cv.perstudy$outcome=="unfav",
-                           c("est","lo", "hi")] <- calc.val_abc(
-                             data = bothi[bothi$trial==trials[j],],
-                             measure = "B",
-                             outcome = "unfav")
-        result.cv.perstudy[result.cv.perstudy$study==trials[j]&
-                             result.cv.perstudy$model==i&
-                             result.cv.perstudy$measure=="c"&
-                             result.cv.perstudy$outcome=="mort",
-                           c("est","lo", "hi")] <- calc.val_abc(
-                             data = bothi[bothi$trial==trials[j],],
-                             measure = "C",
-                             outcome = "mort")
-        result.cv.perstudy[result.cv.perstudy$study==trials[j]&
-                             result.cv.perstudy$model==i&
-                             result.cv.perstudy$measure=="c"&
-                             result.cv.perstudy$outcome=="unfav",
-                           c("est","lo", "hi")] <- calc.val_abc(
-                             data = bothi[bothi$trial==trials[j],],
-                             measure = "C",
-                             outcome = "unfav")
-
-    
-  }
-}
-dev.off()
-
+```{r combine trainings}
+load("Output/results_cv/results.cs.perstudy_gbm_.RData")
+result.cv.perstudy_main <- result.cv.perstudy
+load("Output/results_cv/results.cs.perstudy_LR_.RData")
+result.cv.perstudy_main <- rbind(result.cv.perstudy_main,result.cv.perstudy)
+load("Output/results_cv/results.cs.perstudy_ranger_.RData")
+result.cv.perstudy_main <- rbind(result.cv.perstudy_main,result.cv.perstudy)
+load("Output/results_cv/results.cs.perstudy_lasso_.RData")
+result.cv.perstudy_main <- rbind(result.cv.perstudy_main,result.cv.perstudy)
+load("Output/results_cv/results.cs.perstudy_nnet_.RData")
+result.cv.perstudy_main <- rbind(result.cv.perstudy_main,result.cv.perstudy)
+load("Output/results_cv/results.cs.perstudy_ridge_.RData")
+result.cv.perstudy_main <- rbind(result.cv.perstudy_main,result.cv.perstudy)
+load("Output/results_cv/results.cs.perstudy_svmLinear_.RData")
+result.cv.perstudy <- rbind(result.cv.perstudy_main,result.cv.perstudy)
 
 result.cv.perstudy$nice <- nice_res2(result.cv.perstudy$est, result.cv.perstudy$lo, result.cv.perstudy$hi)
-save(result.cv.perstudy, file="Output/results.cs.perstudy.RData")
+
 ```
 
+
 ```{r forest plots}
-load("Output/results.cs.perstudy.RData")
 
 
 key.impact.center <- data.frame(prev.lab=levels(bothi$trial),
@@ -578,16 +293,21 @@ result.cv.perstudy$rct_obs <- ifelse(result.cv.perstudy$new.lab%in%c("CENTER-TBI
 n.df <- data.frame(table(both$trial))
 colnames(n.df) <- c("study", "n")
 result.cv.perstudy <- merge(result.cv.perstudy, n.df, by="study")
+result.cv.perstudy$Model <- result.cv.perstudy$model 
+levels(result.cv.perstudy$Model) <- c("GBM","LR","RF","Lasso","NN","Ridge","SVM")
+result.cv.perstudy$Model <- factor(result.cv.perstudy$Model, levels=c("LR","SVM","RF","NN","GBM","Lasso","Ridge"))
 
 
-plot_c.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="c"&
+plot_c.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="c"&
                                           result.cv.perstudy$outcome=="mort"&
                                           result.cv.perstudy$rct_obs=="Observational",], 
-       aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=model))+
+       aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
   geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
   scale_y_continuous(limit=c(0.6,0.95))+
   geom_point(position = position_dodge(width = 0.9), cex=4)+
   xlab("Study")+ylab("Estimated C-statistic")+
+  ggtitle("A")+
   facet_wrap(~rct_obs)+
   theme_bw(base_size = 15)+
   theme(legend.position="none",
@@ -595,10 +315,11 @@ plot_c.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="c"&
         axis.text.x=element_text(size=24, angle = 90),
         axis.title.y=element_text(size=28),
         axis.text.y=element_text(size=24))
-plot_c.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="c"&
+plot_c.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="c"&
                                           result.cv.perstudy$outcome=="mort"&
                                           result.cv.perstudy$rct_obs=="RCT",], 
-                     aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=model))+
+                     aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
   geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
   geom_point(position = position_dodge(width = 0.9), cex=4)+
   scale_y_continuous(name="", limit=c(0.6,0.95))+
@@ -612,13 +333,15 @@ plot_c.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="c"&
         legend.title=element_text(size=28),
         legend.text=element_text(size=24))
 
-plot_a.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="a"&
+plot_a.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="a"&
                                       result.cv.perstudy$outcome=="mort"&
                                       result.cv.perstudy$rct_obs=="Observational",], 
-       aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=model))+
+       aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
   geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
   geom_point(position = position_dodge(width = 0.9), cex=4)+
   xlab("Study")+ylab("Estimated calibration intercept")+
+  ggtitle("B")+
   scale_y_continuous(limits=c(-1.3, 1.5))+
   geom_hline(yintercept = 0, lty=2)+
   facet_wrap(~rct_obs)+
@@ -628,10 +351,11 @@ plot_a.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="a"&
         axis.text.x=element_text(size=24, angle = 90),
         axis.title.y=element_text(size=28),
         axis.text.y=element_text(size=24))
-plot_a.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="a"&
+plot_a.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="a"&
                                           result.cv.perstudy$outcome=="mort"&
                                           result.cv.perstudy$rct_obs=="RCT",], 
-                     aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=model))+
+                     aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
   geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
   geom_point(position = position_dodge(width = 0.9), cex=4)+
   scale_y_continuous(name = "", limits=c(-1.3, 1.5))+
@@ -646,15 +370,16 @@ plot_a.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="a"&
         legend.title=element_text(size=28),
         legend.text=element_text(size=24))
 
-plot_b.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="b"&
+plot_b.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="b"&
                                       result.cv.perstudy$outcome=="mort"&
                                       result.cv.perstudy$rct_obs=="Observational",], 
-       aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=model))+
+       aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
   geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
   geom_point(position = position_dodge(width = 0.9), cex=4)+
   xlab("Study")+ylab("Estimated calibration slope")+
   scale_y_continuous(limits=c(0.1,2))+
-  ggtitle(label = "Result cross-validation: calibration slope", subtitle = "6 Months mortality")+
+  ggtitle(label = "C")+
   geom_hline(yintercept = 1, lty=2)+
   facet_wrap(~rct_obs)+
   theme_bw(base_size = 15)+
@@ -663,10 +388,11 @@ plot_b.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="b"&
         axis.text.x=element_text(size=24, angle = 90),
         axis.title.y=element_text(size=28),
         axis.text.y=element_text(size=24))
-plot_b.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="b"&
+plot_b.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="b"&
                                           result.cv.perstudy$outcome=="mort"&
                                           result.cv.perstudy$rct_obs=="RCT",], 
-                     aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=model))+
+                     aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
   geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
   geom_point(position = position_dodge(width = 0.9), cex=4)+
   xlab("Study")+ylab("Estimated calibration slope")+
@@ -681,10 +407,54 @@ plot_b.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$measure=="b"&
         legend.title=element_text(size=28),
         legend.text=element_text(size=24))
 
-plot_a.obs+plot_a.rct
-plot_b.obs+plot_b.rct
-plot_c.obs+plot_c.rct
 
+plot_brier.obs <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="brier"&
+                                      result.cv.perstudy$outcome=="mort"&
+                                      result.cv.perstudy$rct_obs=="Observational",], 
+       aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
+  geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
+  geom_point(position = position_dodge(width = 0.9), cex=4)+
+  xlab("Study")+ylab("Estimated brier score")+
+  scale_y_continuous(limits=c(0,0.3))+
+  ggtitle(label = "D")+
+  facet_wrap(~rct_obs)+
+  theme_bw(base_size = 15)+
+  theme(legend.position="none",
+        axis.title.x = element_text(size=28),
+        axis.text.x=element_text(size=24, angle = 90),
+        axis.title.y=element_text(size=28),
+        axis.text.y=element_text(size=24))
+plot_brier.rct <- ggplot(result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                          result.cv.perstudy$measure=="brier"&
+                                          result.cv.perstudy$outcome=="mort"&
+                                          result.cv.perstudy$rct_obs=="RCT",], 
+                     aes(x=new.lab, y=est, ymin=lo, ymax=hi, col=Model))+
+  geom_linerange(position = position_dodge(width = 0.9), cex=2)+ 
+  geom_point(position = position_dodge(width = 0.9), cex=4)+
+  xlab("Study")+ylab("Estimated calibration slope")+
+  scale_y_continuous(name = "", limits=c(0,0.3))+
+  facet_wrap(~rct_obs)+
+  theme_bw(base_size = 15)+
+  theme(axis.title.x = element_text(size=28),
+        axis.text.x=element_text(size=24, angle = 90),
+        axis.title.y=element_text(size=28),
+        axis.text.y=element_text(size=24),
+        legend.title=element_text(size=28),
+        legend.text=element_text(size=24))
+bgravesteijn::multiplot(plot_a.obs,plot_a.rct,
+                        plot_b.obs,plot_b.rct,
+                        plot_c.obs,plot_c.rct,
+                        plot_brier.obs, plot_brier.rct,
+                        layout=matrix(1:8, ncol = 2, byrow = TRUE))
+
+tiff("Output/cv_all_studies_ranger.tiff", width=20000, height=11000,res=800, compression="lzw")
+bgravesteijn::multiplot(plot_c.obs+plot_c.rct,
+                        plot_a.obs+plot_a.rct,
+                        plot_b.obs+plot_b.rct,
+                        plot_brier.obs+ plot_brier.rct,
+                        layout=matrix(1:4, ncol = 2, byrow = TRUE))
+dev.off()
 pdf("Output/cv_all_studies.pdf", width=25, height=10)
 plot_a.obs+plot_a.rct
 plot_b.obs+plot_b.rct
@@ -694,14 +464,14 @@ dev.off()
 
 ```{r}
 cstattbl<-data.table(result.cv.perstudy[result.cv.perstudy$measure=="c",])
-cstattbl1<-cstattbl[outcome=="mort",.(median(est), 
+cstattbl1<-cstattbl[outcome=="mort"&new.lab!="CENTER-TBI",.(median(est), 
                                       quantile(est,probs=0.25), 
                                       quantile(est,probs=0.75)), by=model]
 cstattbl1$all<-nice_res2(x = cstattbl1$V1, xlo = cstattbl1$V2, xhi= cstattbl1$V3)
 cstattbl1<-cstattbl1[,c(1,5)]
 cstattbl2<-cstattbl[new.lab=="CENTER-TBI"&outcome=="mort",.(nice), by=model]
 mort_c<-merge(cstattbl1,cstattbl2, by="model")
-cstattbl1<-cstattbl[outcome=="unfav",.(median(est), 
+cstattbl1<-cstattbl[outcome=="unfav"&new.lab!="CENTER-TBI",.(median(est), 
                                        quantile(est,probs=0.25), 
                                        quantile(est,probs=0.75)), by=model]
 cstattbl1$all<-nice_res2(x = cstattbl1$V1, xlo = cstattbl1$V2, xhi= cstattbl1$V3)
@@ -713,8 +483,9 @@ c_res$outcome<-c(rep("mort", 0.5*nrow(c_res)), rep("unfav", 0.5*nrow(c_res)))
 
 c_res$me_avg <- 0
 
-re_pool <- function(se=NULL, est=NULL){
+re_pool <- function(se=NULL, est=NULL,logtransf=FALSE){
   ##https://www.meta-analysis.com/downloads/M-a_f_e_v_r_e_sv.pdf##
+  
   w  <- (1/(se^2))
   mu <- mean(est)
   q <- sum(w*((est-mu)^2))
@@ -724,19 +495,27 @@ re_pool <- function(se=NULL, est=NULL){
   w_re <- (1/((se^2)+tau2))
   est_pool <- weighted.mean(x = est, w = w_re)
   se_pool <- sqrt((1/sum(w_re)))
-  res <-   nice_res2(x = est_pool, xlo = est_pool-1.96*se_pool, xhi = est_pool+1.96*se_pool)
+  if(logtransf){
+    res <-   nice_res2(x = exp(est_pool), 
+                       xlo = exp(est_pool-1.96*se_pool), 
+                       xhi = exp(est_pool+1.96*se_pool))
+  }else{
+   res <-   nice_res2(x = est_pool, xlo = est_pool-1.96*se_pool, xhi = est_pool+1.96*se_pool) 
+  }
   return(res)
 }
 
 for(i in unique(c_res$model)){
-  data_mort <- result.cv.perstudy[result.cv.perstudy$model==i&
+  data_mort <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                    result.cv.perstudy$model==i&
                       result.cv.perstudy$outcome=="mort"&
                       result.cv.perstudy$measure=="c",]
   data_mort$se <- (data_mort$hi-data_mort$est)/1.96
   c_res$me_avg[c_res$model==i&
                  c_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
   
-  data_unfav <- result.cv.perstudy[result.cv.perstudy$model==i&
+  data_unfav <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                     result.cv.perstudy$model==i&
                       result.cv.perstudy$outcome=="unfav"&
                       result.cv.perstudy$measure=="c",]
   data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
@@ -746,14 +525,14 @@ for(i in unique(c_res$model)){
 }
 
 astattbl<-data.table(result.cv.perstudy[result.cv.perstudy$measure=="a",])
-astattbl1<-astattbl[outcome=="mort",.(median(est), 
+astattbl1<-astattbl[outcome=="mort"&new.lab!="CENTER-TBI",.(median(est), 
                                       quantile(est,probs=0.25), 
                                       quantile(est,probs=0.75)), by=model]
 astattbl1$all<-nice_res2(x = astattbl1$V1, xlo = astattbl1$V2, xhi= astattbl1$V3)
 astattbl1<-astattbl1[,c(1,5)]
 astattbl2<-astattbl[new.lab=="CENTER-TBI"&outcome=="mort",.(nice), by=model]
 mort_a<-merge(astattbl1,astattbl2, by="model")
-astattbl1<-astattbl[outcome=="unfav",.(median(est), 
+astattbl1<-astattbl[outcome=="unfav"&new.lab!="CENTER-TBI",.(median(est), 
                                        quantile(est,probs=0.25), 
                                        quantile(est,probs=0.75)), by=model]
 astattbl1$all<-nice_res2(x = astattbl1$V1, xlo = astattbl1$V2, xhi= astattbl1$V3)
@@ -765,14 +544,16 @@ a_res$outcome<-c(rep("mort", 0.5*nrow(c_res)), rep("unfav", 0.5*nrow(c_res)))
 
 a_res$me_avg <- 0
 for(i in unique(a_res$model)){
-  data_mort <- result.cv.perstudy[result.cv.perstudy$model==i&
+  data_mort <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                    result.cv.perstudy$model==i&
                       result.cv.perstudy$outcome=="mort"&
                       result.cv.perstudy$measure=="a",]
   data_mort$se <- (data_mort$hi-data_mort$est)/1.96
   a_res$me_avg[a_res$model==i&
                  a_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
   
-  data_unfav <- result.cv.perstudy[result.cv.perstudy$model==i&
+  data_unfav <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                     result.cv.perstudy$model==i&
                       result.cv.perstudy$outcome=="unfav"&
                       result.cv.perstudy$measure=="a",]
   data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
@@ -783,14 +564,14 @@ for(i in unique(a_res$model)){
 
 
 bstattbl<-data.table(result.cv.perstudy[result.cv.perstudy$measure=="b",])
-bstattbl1<-bstattbl[outcome=="mort",.(median(est), 
+bstattbl1<-bstattbl[outcome=="mort"&new.lab!="CENTER-TBI",.(median(est), 
                                       quantile(est,probs=0.25), 
                                       quantile(est,probs=0.75)), by=model]
 bstattbl1$all<-nice_res2(x = bstattbl1$V1, xlo = bstattbl1$V2, xhi= bstattbl1$V3)
 bstattbl1<-bstattbl1[,c(1,5)]
 bstattbl2<-bstattbl[new.lab=="CENTER-TBI"&outcome=="mort",.(nice), by=model]
 mort_b<-merge(bstattbl1,bstattbl2, by="model")
-bstattbl1<-bstattbl[outcome=="unfav",.(median(est), 
+bstattbl1<-bstattbl[outcome=="unfav"&new.lab!="CENTER-TBI",.(median(est), 
                                        quantile(est,probs=0.25), 
                                        quantile(est,probs=0.75)), by=model]
 bstattbl1$all<-nice_res2(x = bstattbl1$V1, xlo = bstattbl1$V2, xhi= bstattbl1$V3)
@@ -802,14 +583,16 @@ b_res$outcome<-c(rep("mort", 0.5*nrow(c_res)), rep("unfav", 0.5*nrow(c_res)))
 
 b_res$me_avg <- 0
 for(i in unique(b_res$model)){
-  data_mort <- result.cv.perstudy[result.cv.perstudy$model==i&
+  data_mort <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                    result.cv.perstudy$model==i&
                       result.cv.perstudy$outcome=="mort"&
                       result.cv.perstudy$measure=="b",]
   data_mort$se <- (data_mort$hi-data_mort$est)/1.96
   b_res$me_avg[b_res$model==i&
                  b_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
   
-  data_unfav <- result.cv.perstudy[result.cv.perstudy$model==i&
+  data_unfav <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                     result.cv.perstudy$model==i&
                       result.cv.perstudy$outcome=="unfav"&
                       result.cv.perstudy$measure=="b",]
   data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
@@ -818,23 +601,66 @@ for(i in unique(b_res$model)){
   
 }
 
-b_res<-b_res[,c(1,4,5,3)]
-a_res<-a_res[,c(1,4,5,3)]
-c_res<-c_res[,c(1,4,5,3)]
+brierstattbl<-data.table(result.cv.perstudy[result.cv.perstudy$measure=="brier",])
+brierstattbl1<-brierstattbl[outcome=="mort"&new.lab!="CENTER-TBI",.(median(est), 
+                                      quantile(est,probs=0.25), 
+                                      quantile(est,probs=0.75)), by=model]
+brierstattbl1$all<-nice_res2(x = brierstattbl1$V1, xlo = brierstattbl1$V2, xhi= brierstattbl1$V3)
+brierstattbl1<-brierstattbl1[,c(1,5)]
+brierstattbl2<-brierstattbl[new.lab=="CENTER-TBI"&outcome=="mort",.(nice), by=model]
+mort_brier<-merge(brierstattbl1,brierstattbl2, by="model")
+brierstattbl1<-brierstattbl[outcome=="unfav"&new.lab!="CENTER-TBI",.(median(est), 
+                                       quantile(est,probs=0.25), 
+                                       quantile(est,probs=0.75)), by=model]
+brierstattbl1$all<-nice_res2(x = brierstattbl1$V1, xlo = brierstattbl1$V2, xhi= brierstattbl1$V3)
+brierstattbl1<-brierstattbl1[,c(1,5)]
+brierstattbl2<-brierstattbl[new.lab=="CENTER-TBI"&outcome=="unfav",.(nice), by=model]
+unfav_brier<-merge(brierstattbl1,brierstattbl2, by="model")
+brier_res<-rbind(mort_brier, unfav_brier)
+brier_res$outcome<-c(rep("mort", 0.5*nrow(c_res)), rep("unfav", 0.5*nrow(c_res)))
+
+brier_res$me_avg <- 0
+for(i in unique(brier_res$model)){
+  data_mort <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                    result.cv.perstudy$model==i&
+                      result.cv.perstudy$outcome=="mort"&
+                      result.cv.perstudy$measure=="brier",]
+  data_mort$se <- (data_mort$hi-data_mort$est)/1.96
+  brier_res$me_avg[brier_res$model==i&
+                 brier_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
+  
+  data_unfav <- result.cv.perstudy[result.cv.perstudy$new.lab!="CENTER-TBI"&
+                                     result.cv.perstudy$model==i&
+                      result.cv.perstudy$outcome=="unfav"&
+                      result.cv.perstudy$measure=="brier",]
+  data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
+  brier_res$me_avg[brier_res$model==i&
+                 brier_res$outcome=="unfav"] <- re_pool(se = data_unfav$se, est=data_unfav$est)
+  
+}
+
+b_res<-b_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+             c(1,4,5,3)]
+a_res<-a_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+             c(1,4,5,3)]
+c_res<-c_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+             c(1,4,5,3)]
+brier_res<-brier_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+                 c(1,4,5,3)]
 
 kable(c_res)
 kable(a_res)
 kable(b_res)
+kable(brier_res)
 write.csv2(b_res, file = "Output/result_b.csv")
+write.csv2(brier_res, file = "Output/result_brier.csv")
 write.csv2(a_res, file = "Output/result_a.csv")
 write.csv2(c_res, file = "Output/result_c.csv")
 ```
-
-##Discrimination
-Although the difference between maximum and minimum c-statistic of the models was only `r max(as.numeric(substr(c_res$me_avg,start=1,stop=4))[1:7])-min(as.numeric(substr(c_res$me_avg,start=1,stop=4))[1:7])` for mortality and `r max(as.numeric(substr(c_res$me_avg,start=1,stop=4))[8:14])-min(as.numeric(substr(c_res$me_avg,start=1,stop=4))[8:14])` for unfavourable outcome, the discriminatory performance of the random forest was suboptimal: the median and IQR of c-statistic of the random forest were `r c_res[c_res$model=="rf"&c_res$outcome=="mort", "me_avg"]` for mortality (the overall average was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="mort"&result.cv.perstudy$measure=="c"]))`) and `r c_res[c_res$model=="rf"&c_res$outcome=="unfav", "me_avg"]` for unfavourable outcome (the overall average was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="unfav"&result.cv.perstudy$measure=="c"]))`) (figure 2 and table 2 in appendix 1). This pattern was also seen when validating in CENTER-TBI, although discrimination was somewhat higher in this observational study: The random forest showed a median and 95% CI for the c-statistic of `r c_res[c_res$model=="rf"&c_res$outcome=="mort", "nice"]` for mortality  (overall average was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="mort"&result.cv.perstudy$measure=="c"&result.cv.perstudy$study=="center"]))`) and `r c_res[c_res$model=="rf"&c_res$outcome=="unfav", "nice"]` for unfavourable outcome (overall average was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="unfav"&result.cv.perstudy$measure=="c"&result.cv.perstudy$study=="center"]))`). Similar results were observed over a different imputed set, see table 5 in appendix 1.
-
-##Calibration
-The range of average calibration intercepts was small across the models: the range of calibration intercepts was `r min(as.numeric(substr(a_res$me_avg,start=1,stop=5))[1:7])` - `r max(as.numeric(substr(a_res$me_avg,start=1,stop=5))[1:7])` for mortality and `r min(as.numeric(substr(a_res$me_avg,start=1,stop=5))[8:14])` - `r max(as.numeric(substr(a_res$me_avg,start=1,stop=5))[8:14])` for unfavourable outcome (figure 2 and table 3, appendix 1). However, the range of calibration slopes was larger: `r min(as.numeric(substr(b_res$me_avg,start=1,stop=5))[1:7])` - `r max(as.numeric(substr(b_res$me_avg,start=1,stop=5))[1:7])` for mortality and `r min(as.numeric(substr(b_res$me_avg,start=1,stop=5))[8:14])` - `r max(as.numeric(substr(b_res$me_avg,start=1,stop=5))[8:14])` for unfavourable outcome (figure 3 and table 4, appendix 1). The random forest made too extreme predictions, with a median (95% CI) calibration slope of `r b_res[b_res$model=="rf"&b_res$outcome=="mort",3]` for mortality (the overall mean was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="mort"&result.cv.perstudy$measure=="b"]))`) and `r b_res[b_res$model=="rf"&b_res$outcome=="unfav",3]` for unfavourable outcome (the overall mean was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="unfav"&result.cv.perstudy$measure=="b"]))`). This pattern was similar when calibration was assessed in the CENTER-TBI study. On the contrary, the penalized regression methods made predictions somewhat too moderate (close to 0): lasso regression showed a calibration slope of `r as.character(b_res[b_res$model=="lasso"&b_res$outcome=="mort","me_avg"])` for mortality and `r as.character(b_res[b_res$model=="lasso"&b_res$outcome=="unfav","me_avg"])` for unfavourable outcome, and ridge regression showed a calibration slope of `r as.character(b_res[b_res$model=="ridge"&b_res$outcome=="mort","me_avg"])` for mortality and `r as.character(b_res[b_res$model=="ridge"&b_res$outcome=="unfav","me_avg"])` for unfavourable outcome. The calibration intercept for mortality was generally low in CENTER-TBI: the overall mean was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="mort"&result.cv.perstudy$measure=="a"&result.cv.perstudy$study=="center"]))`, indicating that the 6-month mortality was lower than expected in CENTER-TBI. Additionally, for unfavourable outcome, the calibration slope was `r sprintf("%.2f",mean(result.cv.perstudy$est[result.cv.perstudy$outcome=="unfav"&result.cv.perstudy$measure=="b"&result.cv.perstudy$study=="center"]))`, indicating that for unfavourable outcome the models made too extreme predictions in CENTER-TBI. The model that predicted unfavourable outcome best in CENTER-TBI was ridge regression (c-statistic: `r c_res[c_res$outcome=="unfav"&c_res$model=="ridge","nice"]`,calibration slope `r b_res[b_res$outcome=="unfav"&b_res$model=="ridge","nice"]`). 
 
 
 
@@ -845,16 +671,21 @@ fit_a <- lmer(est~1+(1|model)+(1|study), result.cv.perstudy[result.cv.perstudy$m
                                                             result.cv.perstudy$outcome=="mort",])
 fit_b <- lmer(est~1+(1|model)+(1|study), result.cv.perstudy[result.cv.perstudy$measure=="b"&
                                                             result.cv.perstudy$outcome=="mort",])
+fit_brier <- lmer(est~1+(1|model)+(1|study), result.cv.perstudy[result.cv.perstudy$measure=="brier"&
+                                                            result.cv.perstudy$outcome=="mort",])
 
 vc_c <- lme4::VarCorr(fit_c)
 vc_a <- lme4::VarCorr(fit_a)
 vc_b <- lme4::VarCorr(fit_b)
+vc_brier <- lme4::VarCorr(fit_brier)
 prop.var.c1_s <- data.frame(vc_c)$vcov[1]/sum(data.frame(vc_c)$vcov)
 prop.var.a1_s <- data.frame(vc_a)$vcov[1]/sum(data.frame(vc_a)$vcov)
 prop.var.b1_s <- data.frame(vc_b)$vcov[1]/sum(data.frame(vc_b)$vcov)
+prop.var.brier1_s <- data.frame(vc_brier)$vcov[1]/sum(data.frame(vc_brier)$vcov)
 prop.var.c1_m <- data.frame(vc_c)$vcov[2]/sum(data.frame(vc_c)$vcov)
 prop.var.a1_m <- data.frame(vc_a)$vcov[2]/sum(data.frame(vc_a)$vcov)
 prop.var.b1_m <- data.frame(vc_b)$vcov[2]/sum(data.frame(vc_b)$vcov)
+prop.var.brier1_m <- data.frame(vc_brier)$vcov[2]/sum(data.frame(vc_brier)$vcov)
 
 fit_c <- lmer(est~1+(1|model)+(1|study), result.cv.perstudy[result.cv.perstudy$measure=="c"&
                                                             result.cv.perstudy$outcome=="unfav",])
@@ -862,42 +693,233 @@ fit_a <- lmer(est~1+(1|model)+(1|study), result.cv.perstudy[result.cv.perstudy$m
                                                             result.cv.perstudy$outcome=="unfav",])
 fit_b <- lmer(est~1+(1|model)+(1|study), result.cv.perstudy[result.cv.perstudy$measure=="b"&
                                                             result.cv.perstudy$outcome=="unfav",])
+fit_brier <- lmer(est~1+(1|model)+(1|study), result.cv.perstudy[result.cv.perstudy$measure=="brier"&
+                                                            result.cv.perstudy$outcome=="unfav",])
 
 vc_c <- lme4::VarCorr(fit_c)
 vc_a <- lme4::VarCorr(fit_a)
 vc_b <- lme4::VarCorr(fit_b)
+vc_brier <- lme4::VarCorr(fit_brier)
 prop.var.c2_s <- data.frame(vc_c)$vcov[1]/sum(data.frame(vc_c)$vcov)
 prop.var.a2_s <- data.frame(vc_a)$vcov[1]/sum(data.frame(vc_a)$vcov)
 prop.var.b2_s <- data.frame(vc_b)$vcov[1]/sum(data.frame(vc_b)$vcov)
+prop.var.brier2_s <- data.frame(vc_brier)$vcov[1]/sum(data.frame(vc_brier)$vcov)
 prop.var.c2_m <- data.frame(vc_c)$vcov[2]/sum(data.frame(vc_c)$vcov)
 prop.var.a2_m <- data.frame(vc_a)$vcov[2]/sum(data.frame(vc_a)$vcov)
 prop.var.b2_m <- data.frame(vc_b)$vcov[2]/sum(data.frame(vc_b)$vcov)
+prop.var.brier2_m <- data.frame(vc_brier)$vcov[2]/sum(data.frame(vc_brier)$vcov)
 
-res.htrg <- data.frame(mortality=rep(" ", 3),
+res.htrg <- data.frame(mortality=rep(" ", 4),
                        model = sprintf("%.1f",
                                        c(prop.var.c1_m, 
                                          prop.var.a1_m, 
-                                         prop.var.b1_m)*100),
+                                         prop.var.b1_m,
+                                         prop.var.brier1_m)*100),
                        study = sprintf("%.1f",
                                        c(prop.var.c1_s, 
                                          prop.var.a1_s, 
-                                         prop.var.b1_s)*100),
-                       mortality=rep(" ", 3),
+                                         prop.var.b1_s,
+                                         prop.var.brier1_s)*100),
+                       unfavorable=rep(" ", 4),
                        model = sprintf("%.1f",
                                        c(prop.var.c2_m, 
                                          prop.var.a2_m, 
-                                         prop.var.b2_m)*100), 
+                                         prop.var.b2_m, 
+                                         prop.var.brier2_m)*100), 
                        study = sprintf("%.1f",
                                        c(prop.var.c2_s, 
                                          prop.var.a2_s,  
-                                         prop.var.b2_s)*100))
-rownames(res.htrg) <- c("C-statistic", "Calibration intercept", "Calibration slope")
+                                         prop.var.b2_s, 
+                                         prop.var.brier2_s)*100))
+rownames(res.htrg) <- c("C-statistic", "Calibration intercept", "Calibration slope", "Brier score")
 res.htrg <- t(res.htrg)
 kable(res.htrg)
 write.csv2(res.htrg, file="Output/heterogeneity.csv")
 ```
 
-The variation in c-statistic and calibration intercept was mainly attributable to the study in which the model was validated (table 3): for mortality, the variation in c-statistic was for 89.2% attributable to the study in which the model was validated (versus 7.7% to what model was used); while the variation in calibration intercept was for 97.1% attributable to the study in which the model was validated (versus 0.4% to what model was used). For unfavourable outcome, similar results were observed. On the contrary, variation in calibration slope was more attributable to what model was used, instead of to the study in which the model was validated: for mortality, the variation in calibration slope was for 51.8% attributable to the model used, and only 39.9% attributable to the study in which the model was validated . In fact, this was mostly caused by the poor calibration of the random forest models. This algorithm displayed the worst calibration slope, as indicated in figure 3. 
+ 
+
+## internal 10x10 cross validation 
+
+
+```{r combine trainings}
+load("Output/results_cv/results.cs.intern_gbm_.RData")
+result.cv.intern_main <- result.cv.intern
+load("Output/results_cv/results.cs.intern_LR_.RData")
+result.cv.intern_main <- rbind(result.cv.intern_main,result.cv.intern)
+load("Output/results_cv/results.cs.intern_rf_.RData")
+result.cv.intern_main <- rbind(result.cv.intern_main,result.cv.intern)
+load("Output/results_cv/results.cs.intern_lasso_.RData")
+result.cv.intern_main <- rbind(result.cv.intern_main,result.cv.intern)
+load("Output/results_cv/results.cs.intern_nnet_.RData")
+result.cv.intern_main <- rbind(result.cv.intern_main,result.cv.intern)
+load("Output/results_cv/results.cs.intern_ridge_.RData")
+result.cv.intern_main <- rbind(result.cv.intern_main,result.cv.intern)
+load("Output/results_cv/results.cs.intern_svmLinear_.RData")
+result.cv.intern <- rbind(result.cv.intern_main,result.cv.intern)
+
+result.cv.intern$nice <- nice_res2(result.cv.intern$est, result.cv.intern$lo, result.cv.intern$hi)
+
+
+brierstattbl<-data.table(result.cv.intern[result.cv.intern$measure=="brier",])
+brierstattbl1<-brierstattbl[outcome=="mort",.(median(est), 
+                                      quantile(est,probs=0.25), 
+                                      quantile(est,probs=0.75)), by=model]
+brierstattbl1$all<-nice_res2(x = brierstattbl1$V1, xlo = brierstattbl1$V2, xhi= brierstattbl1$V3)
+brierstattbl1<-brierstattbl1[,c(1,5)]
+
+brierstattbl2<-brierstattbl[outcome=="unfav",.(median(est), 
+                                       quantile(est,probs=0.25), 
+                                       quantile(est,probs=0.75)), by=model]
+brierstattbl2$all<-nice_res2(x = brierstattbl2$V1, xlo = brierstattbl2$V2, xhi= brierstattbl2$V3)
+brierstattbl2<-brierstattbl2[,c(1,5)]
+
+brier_res <- rbind(brierstattbl1, brierstattbl2)
+  
+brier_res$outcome<-c(rep("mort", 0.5*nrow(brier_res)), rep("unfav", 0.5*nrow(brier_res)))
+
+brier_res$me_avg <- 0
+for(i in unique(brier_res$model)){
+  data_mort <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="mort"&
+                      result.cv.intern$measure=="brier",]
+  data_mort$se <- (data_mort$hi-data_mort$est)/1.96
+  brier_res$me_avg[brier_res$model==i&
+                 brier_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
+  
+  data_unfav <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="unfav"&
+                      result.cv.intern$measure=="brier",]
+  data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
+  brier_res$me_avg[brier_res$model==i&
+                 brier_res$outcome=="unfav"] <- re_pool(se = data_unfav$se, est=data_unfav$est)
+  
+}
+brier_res<-brier_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+                 c(1,3,4)]
+
+cstattbl<-data.table(result.cv.intern[result.cv.intern$measure=="c",])
+cstattbl1<-cstattbl[outcome=="mort",.(median(est), 
+                                      quantile(est,probs=0.25), 
+                                      quantile(est,probs=0.75)), by=model]
+cstattbl1$all<-nice_res2(x = cstattbl1$V1, xlo = cstattbl1$V2, xhi= cstattbl1$V3)
+cstattbl1<-cstattbl1[,c(1,5)]
+
+cstattbl2<-cstattbl[outcome=="unfav",.(median(est), 
+                                       quantile(est,probs=0.25), 
+                                       quantile(est,probs=0.75)), by=model]
+cstattbl2$all<-nice_res2(x = cstattbl2$V1, xlo = cstattbl2$V2, xhi= cstattbl2$V3)
+cstattbl2<-cstattbl2[,c(1,5)]
+
+c_res <- rbind(cstattbl1, cstattbl2)
+  
+c_res$outcome<-c(rep("mort", 0.5*nrow(c_res)), rep("unfav", 0.5*nrow(c_res)))
+
+c_res$me_avg <- 0
+for(i in unique(c_res$model)){
+  data_mort <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="mort"&
+                      result.cv.intern$measure=="c",]
+  data_mort$se <- (data_mort$hi-data_mort$est)/1.96
+  c_res$me_avg[c_res$model==i&
+                 c_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
+  
+  data_unfav <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="unfav"&
+                      result.cv.intern$measure=="c",]
+  data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
+  c_res$me_avg[c_res$model==i&
+                 c_res$outcome=="unfav"] <- re_pool(se = data_unfav$se, est=data_unfav$est)
+  
+}
+c_res<-c_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+                 c(1,3,4)]
+
+astattbl<-data.table(result.cv.intern[result.cv.intern$measure=="a",])
+astattbl1<-astattbl[outcome=="mort",.(median(est), 
+                                      quantile(est,probs=0.25), 
+                                      quantile(est,probs=0.75)), by=model]
+astattbl1$all<-nice_res2(x = astattbl1$V1, xlo = astattbl1$V2, xhi= astattbl1$V3)
+astattbl1<-astattbl1[,c(1,5)]
+
+astattbl2<-astattbl[outcome=="unfav",.(median(est), 
+                                       quantile(est,probs=0.25), 
+                                       quantile(est,probs=0.75)), by=model]
+astattbl2$all<-nice_res2(x = astattbl2$V1, xlo = astattbl2$V2, xhi= astattbl2$V3)
+astattbl2<-astattbl2[,c(1,5)]
+
+a_res <- rbind(astattbl1, astattbl2)
+  
+a_res$outcome<-c(rep("mort", 0.5*nrow(a_res)), rep("unfav", 0.5*nrow(a_res)))
+
+a_res$me_avg <- 0
+for(i in unique(a_res$model)){
+  data_mort <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="mort"&
+                      result.cv.intern$measure=="a",]
+  data_mort$se <- (data_mort$hi-data_mort$est)/1.96
+  a_res$me_avg[a_res$model==i&
+                 a_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
+  
+  data_unfav <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="unfav"&
+                      result.cv.intern$measure=="a",]
+  data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
+  a_res$me_avg[a_res$model==i&
+                 a_res$outcome=="unfav"] <- re_pool(se = data_unfav$se, est=data_unfav$est)
+  
+}
+a_res<-a_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+                 c(1,3,4)]
+
+bstattbl<-data.table(result.cv.intern[result.cv.intern$measure=="b",])
+bstattbl1<-bstattbl[outcome=="mort",.(median(est), 
+                                      quantile(est,probs=0.25), 
+                                      quantile(est,probs=0.75)), by=model]
+bstattbl1$all<-nice_res2(x = bstattbl1$V1, xlo = bstattbl1$V2, xhi= bstattbl1$V3)
+bstattbl1<-bstattbl1[,c(1,5)]
+
+bstattbl2<-bstattbl[outcome=="unfav",.(median(est), 
+                                       quantile(est,probs=0.25), 
+                                       quantile(est,probs=0.75)), by=model]
+bstattbl2$all<-nice_res2(x = bstattbl2$V1, xlo = bstattbl2$V2, xhi= bstattbl2$V3)
+bstattbl2<-bstattbl2[,c(1,5)]
+
+b_res <- rbind(bstattbl1, bstattbl2)
+  
+b_res$outcome<-c(rep("mort", 0.5*nrow(b_res)), rep("unfav", 0.5*nrow(b_res)))
+
+b_res$me_avg <- 0
+for(i in unique(b_res$model)){
+  data_mort <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="mort"&
+                      result.cv.intern$measure=="b",]
+  data_mort$se <- (data_mort$hi-data_mort$est)/1.96
+  b_res$me_avg[b_res$model==i&
+                 b_res$outcome=="mort"] <- re_pool(se = data_mort$se, est=data_mort$est)
+  
+  data_unfav <- result.cv.intern[result.cv.intern$model==i&
+                      result.cv.intern$outcome=="unfav"&
+                      result.cv.intern$measure=="b",]
+  data_unfav$se <- (data_unfav$hi-data_unfav$est)/1.96
+  b_res$me_avg[b_res$model==i&
+                 b_res$outcome=="unfav"] <- re_pool(se = data_unfav$se, est=data_unfav$est)
+  
+}
+b_res<-b_res[c(2,7,3,5,1,4,6,
+                 9,14,10,12,8,11,13),
+                 c(1,3,4)]
+
+write.csv2(brier_res, file = "Output/brier_res_10xcv.csv")
+write.csv2(a_res, file = "Output/a_res_10xcv.csv")
+write.csv2(b_res, file = "Output/b_res_10xcv.csv")
+write.csv2(c_res, file = "Output/c_res_10xcv.csv")
+```
+
+
 
 
 ```{r sensitivity analysis mi}
@@ -955,5 +977,65 @@ for(i in unique(c_res$model)){
 
 write.csv2(c_res,"Output/c_stat_sensitivity.csv")
 
+```
+
+#explore linearity/additivity assumption
+
+```{r}
+fit.mort <- glm(mort~age+
+                  d_motor.1+d_motor.2+d_motor.3+d_motor.4+d_motor.5+d_motor.6+
+                  d_pupil.1+d_pupil.2+d_pupil.3+
+                  ct_class.1+ct_class.2+ct_class.3+ct_class.4+ct_class.5+
+                  tsah+
+                  edh+
+                  hypoxia+
+                  hypotens+
+                  glucose+
+                  hb, data=bothi, family = "binomial")
+fit.mort_nl <- glm(mort~rcs(age,3)+
+                  d_motor.1+d_motor.2+d_motor.3+d_motor.4+d_motor.5+d_motor.6+
+                  d_pupil.1+d_pupil.2+d_pupil.3+
+                  ct_class.1+ct_class.2+ct_class.3+ct_class.4+ct_class.5+
+                  tsah+
+                  edh+
+                  hypoxia+
+                  hypotens+
+                  rcs(glucose,3)+
+                  rcs(hb,3), data=bothi, family = "binomial")
+fit.mort_na <- glm(mort~(age+
+                  tsah+
+                  edh+
+                  hypoxia+
+                  hypotens+
+                  glucose+
+                  hb)^2+
+                  (age+
+                  tsah+
+                  edh+
+                  hypoxia+
+                  hypotens+
+                  glucose+
+                  hb)*(d_motor.1+d_motor.2+d_motor.3+d_motor.4+d_motor.5+d_motor.6+
+                  d_pupil.1+d_pupil.2+d_pupil.3+
+                  ct_class.1+ct_class.2+ct_class.3+ct_class.4+ct_class.5), data=bothi, 
+                  family = "binomial")
+
+assump.test <- expand.grid(trial=levels(bothi$trial),
+                           test=c("non-additivity", "non-linearity"),
+                           pval=NA)
+for(i in levels(bothi$trial)){
+  assump.test[assump.test$trial==i&
+                assump.test$test=="non-linearity",
+              "pval"] <- anova(update(fit.mort, subset=bothi$trial==i), 
+                               update(fit.mort_nl, subset=bothi$trial==i), 
+                               test="LRT")$`Pr(>Chi)`[2]
+  assump.test[assump.test$trial==i&
+                assump.test$test=="non-additivity",
+              "pval"] <- anova(update(fit.mort, subset=bothi$trial==i), 
+                               update(fit.mort_na, subset=bothi$trial==i), 
+                               test="LRT")$`Pr(>Chi)`[2]
+}
+
+write.csv2(assump.test, file="output/linearity_interaction.csv")
 ```
 
