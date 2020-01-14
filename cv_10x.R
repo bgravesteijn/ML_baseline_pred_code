@@ -1,4 +1,9 @@
-cur.mod <- 3
+cur.mod <- 6
+
+library(doParallel)
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+
 result.cv.intern <- data.table(expand.grid(cv_n    = 1:10,
                                            model   = models[cur.mod],
                                            outcome = c("unfav", "mort"),
@@ -38,7 +43,7 @@ for (i in models[cur.mod]){
                               y=  y, 
                               family="binomial",
                               alpha=1,
-                              type.measure="class")
+                              type.measure="deviance")
           
           dat.unfav <- cv_train[,c(vars_unfav)]
           
@@ -49,7 +54,7 @@ for (i in models[cur.mod]){
                                y=  y,
                                alpha=1, 
                                family="binomial",
-                               type.measure="class")
+                               type.measure="deviance")
         }else{
           if(i=="ridge"){
             dat.mort <- cv_train[,c(vars_mort)]
@@ -61,7 +66,7 @@ for (i in models[cur.mod]){
                                 y=  y, 
                                 family="binomial",
                                 alpha=0,
-                                type.measure="class")
+                                type.measure="deviance")
             
             dat.unfav <- cv_train[,c(vars_unfav)]
             
@@ -72,7 +77,7 @@ for (i in models[cur.mod]){
                                  y= y , 
                                  family="binomial",
                                  alpha=0,
-                                 type.measure="class")
+                                 type.measure="deviance")
           }else{
             if(i=="ranger"){
               tune_grid <- expand.grid(mtry=c(2,5, 10, 18),

@@ -1,7 +1,7 @@
-cur.mod <- 7
+cur.mod <- 6
 
 library(doParallel)
-cl <- makePSOCKcluster(2)
+cl <- makePSOCKcluster(4)
 registerDoParallel(cl)
 
 result.cv.perstudy <- expand.grid(study   = trials,
@@ -37,7 +37,7 @@ for (i in models[cur.mod]){
                             y=  y, 
                             family="binomial",
                             alpha=1,
-                            type.measure="class")
+                            type.measure="deviance")
         
         dat.unfav <- bothi[!bothi$trial%in%c(trials[j],"center"),vars_unfav]
         
@@ -48,7 +48,7 @@ for (i in models[cur.mod]){
                              y=  y,
                              alpha=1, 
                              family="binomial",
-                             type.measure="class")
+                             type.measure="deviance")
       }else{
         if(i=="ridge"){
           dat.mort <- bothi[!bothi$trial%in%c(trials[j],"center"),vars_mort]
@@ -59,7 +59,7 @@ for (i in models[cur.mod]){
                               y=  y, 
                               family="binomial",
                               alpha=0,
-                              type.measure="class")
+                              type.measure="deviance")
           
           dat.unfav <- bothi[!bothi$trial%in%c(trials[j],"center"),vars_unfav]
           ### no/yes into 0/1
@@ -70,7 +70,7 @@ for (i in models[cur.mod]){
                                y= y , 
                                family="binomial",
                                alpha=0,
-                               type.measure="class")
+                               type.measure="deviance")
         }else{
           if(i=="ranger"){
             tune_grid <- expand.grid(mtry=c(2,5, 10, 18),
